@@ -237,6 +237,7 @@ dependencies = [
  "anyhow",
  "hive-core",
  "hive-spec",
+ "serde_json",
  "toml",
 ]
 
