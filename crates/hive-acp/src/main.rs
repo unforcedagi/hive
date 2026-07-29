@@ -33,6 +33,16 @@
 //! harness advertising `mcpCapabilities.http`, not only the one whose config
 //! format hive happens to know.
 //!
+//! The same request carries a `cwd`, and that one is a genuine impedance
+//! mismatch rather than a missing feature: the client picks a directory on the
+//! machine *it* is running on, and the harness is on the other side of a
+//! container boundary where that path means nothing. `claude-agent-acp`
+//! validates it and rejects the session outright, so a client that never asked
+//! for a container gets `cwd does not exist on the machine running the agent`
+//! and no session. hive substitutes the agent's workspace — but only when the
+//! path is genuinely absent inside the container, so a deliberately
+//! bind-mounted host path still resolves to itself.
+//!
 //! **Everything else is copied verbatim, in both directions.** A proxy that
 //! re-frames JSON-RPC it has no reason to read can corrupt a stream it was only
 //! meant to carry, so anything that is not a `session/new` request — including
@@ -139,7 +149,48 @@ fn fetch_headers(container: &str, server: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Append this agent's MCP servers to a `session/new` request.
+/// Is this an existing directory *inside the container*?
+///
+/// Used to tell a path the container genuinely has — a bind-mounted host
+/// directory, say — from one that only exists on the client's machine.
+fn dir_exists_in(container: &str, path: &str) -> bool {
+    Command::new(find_docker())
+        .args(["exec", container, "test", "-d", path])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Where the harness should work when the client's `cwd` is a host path.
+///
+/// `HIVE_ACP_WORKSPACE` wins, so an operator whose image is laid out
+/// differently is not stuck. Otherwise `/home/agent/work`, which hive's agent
+/// image creates for exactly this; then the image's own `WORKDIR`. The last
+/// resort is `/`, which every container has — a wrong-but-present directory
+/// still starts a session the operator can inspect, where a missing one just
+/// reproduces the failure this function exists to prevent.
+fn resolve_workspace(container: &str) -> String {
+    if let Some(v) = std::env::var("HIVE_ACP_WORKSPACE").ok().filter(|s| !s.is_empty()) {
+        return v;
+    }
+    if dir_exists_in(container, "/home/agent/work") {
+        return "/home/agent/work".to_string();
+    }
+    let out = Command::new(find_docker())
+        .args(["inspect", "--format", "{{.Config.WorkingDir}}", container])
+        .output();
+    if let Ok(o) = out {
+        let dir = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if o.status.success() && !dir.is_empty() {
+            return dir;
+        }
+    }
+    "/".to_string()
+}
+
+/// Adapt a `session/new` request to the container it is really headed for.
 ///
 /// Returns `None` for anything that is not a `session/new` request, including
 /// lines that are not JSON — the caller then forwards the original bytes.
@@ -149,10 +200,19 @@ fn fetch_headers(container: &str, server: &str) -> Vec<(String, String)> {
 /// configured in hive are not alternatives, and silently dropping the former
 /// would make hive's involvement look like a Buzz bug.
 fn rewrite_session_new(line: &str, mcp: &[McpEntry], container: &str) -> Option<String> {
-    inject(line, mcp, &|e: &McpEntry| match &e.credential {
-        Some(_) => fetch_headers(container, &e.name),
-        None => Vec::new(),
-    })
+    inject(
+        line,
+        mcp,
+        &|e: &McpEntry| match &e.credential {
+            Some(_) => fetch_headers(container, &e.name),
+            None => Vec::new(),
+        },
+        // Resolving the workspace costs two `docker` calls, so it is deferred
+        // until something actually needs it — which is only when the client
+        // sent a cwd the container does not have.
+        &|| resolve_workspace(container),
+        &|path: &str| dir_exists_in(container, path),
+    )
 }
 
 /// The pure half: everything except talking to the broker.
@@ -163,34 +223,60 @@ fn inject(
     line: &str,
     mcp: &[McpEntry],
     headers_for: &dyn Fn(&McpEntry) -> Vec<(String, String)>,
+    workspace: &dyn Fn() -> String,
+    dir_exists: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
-    if mcp.is_empty() {
-        return None;
-    }
     let mut msg: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     if msg.get("method")?.as_str()? != "session/new" {
         return None;
     }
     let params = msg.get_mut("params")?.as_object_mut()?;
-    let servers = params
-        .entry("mcpServers")
-        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-        .as_array_mut()?;
+    let mut rewrote = false;
 
-    for e in mcp {
-        let headers: Vec<serde_json::Value> = headers_for(e)
-            .into_iter()
-            .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
-            .collect();
-        // `type: "http"` selects the McpServerHttp variant of ACP's McpServer
-        // union. `headers` is required by the schema even when empty.
-        servers.push(serde_json::json!({
-            "type": "http",
-            "name": e.name,
-            "url": e.url,
-            "headers": headers,
-        }));
-        eprintln!("hive-acp: attached MCP server {} -> {}", e.name, e.url);
+    // The client chose this directory on its own machine. Replace it only when
+    // the container really lacks it — a spec that bind-mounts the very path
+    // Buzz is pointing at is a working setup, and redirecting that to the
+    // agent's workspace would quietly ignore what the operator asked for.
+    let stale_cwd = params
+        .get("cwd")
+        .and_then(|c| c.as_str())
+        .filter(|cwd| !dir_exists(cwd))
+        .map(String::from);
+    if let Some(cwd) = stale_cwd {
+        let target = workspace();
+        eprintln!("hive-acp: cwd {cwd:?} is not in the container; using {target:?}");
+        params.insert("cwd".into(), serde_json::Value::String(target));
+        rewrote = true;
+    }
+
+    if !mcp.is_empty() {
+        let servers = params
+            .entry("mcpServers")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()?;
+        for e in mcp {
+            let headers: Vec<serde_json::Value> = headers_for(e)
+                .into_iter()
+                .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+                .collect();
+            // `type: "http"` selects the McpServerHttp variant of ACP's
+            // McpServer union. `headers` is required by the schema even when
+            // empty.
+            servers.push(serde_json::json!({
+                "type": "http",
+                "name": e.name,
+                "url": e.url,
+                "headers": headers,
+            }));
+            eprintln!("hive-acp: attached MCP server {} -> {}", e.name, e.url);
+        }
+        rewrote = true;
+    }
+
+    // Nothing to change: let the caller forward the original bytes rather than
+    // a re-serialized copy that differs in key order and spacing.
+    if !rewrote {
+        return None;
     }
     let mut s = msg.to_string();
     s.push('\n');
@@ -215,6 +301,29 @@ mod tests {
         Vec::new()
     }
 
+    /// A container whose only directory is the agent workspace — so any cwd the
+    /// client sends is a host path, which is the case that matters.
+    fn only_workspace(path: &str) -> bool {
+        path == "/home/agent/work"
+    }
+    fn workspace() -> String {
+        "/home/agent/work".to_string()
+    }
+    /// A container that has whatever it is asked for: nothing needs rewriting.
+    fn everything(_: &str) -> bool {
+        true
+    }
+
+    /// The common case in these tests: MCP injection with a cwd that is already
+    /// valid inside the container, so only `mcpServers` moves.
+    fn inject_mcp_only(
+        line: &str,
+        mcp: &[McpEntry],
+        headers_for: &dyn Fn(&McpEntry) -> Vec<(String, String)>,
+    ) -> Option<String> {
+        inject(line, mcp, headers_for, &workspace, &everything)
+    }
+
     #[test]
     fn only_session_new_is_touched() {
         // Everything else — prompts, cancels, and every response coming back —
@@ -227,7 +336,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
             r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}"#,
         ] {
-            assert!(inject(line, &e, &none).is_none(), "rewrote: {line}");
+            assert!(inject_mcp_only(line, &e, &none).is_none(), "rewrote: {line}");
         }
     }
 
@@ -236,14 +345,14 @@ mod tests {
         // ACP framing is not something to assume. If messages ever stop being
         // newline-delimited, this must degrade to a transparent pipe instead of
         // silently swallowing traffic.
-        assert!(inject("not json at all", &[entry("p")], &none).is_none());
-        assert!(inject("", &[entry("p")], &none).is_none());
+        assert!(inject_mcp_only("not json at all", &[entry("p")], &none).is_none());
+        assert!(inject_mcp_only("", &[entry("p")], &none).is_none());
     }
 
     #[test]
     fn an_agent_with_no_mcp_servers_is_never_rewritten() {
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"mcpServers":[]}}"#;
-        assert!(inject(line, &[], &creds).is_none());
+        assert!(inject_mcp_only(line, &[], &creds).is_none());
     }
 
     #[test]
@@ -252,7 +361,7 @@ mod tests {
         // hive are not alternatives. Dropping the client's would look like a
         // Buzz bug rather than something hive did.
         let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/w","mcpServers":[{"name":"buzzy","command":"x","args":[],"env":[]}]}}"#;
-        let out = inject(line, &[entry("parachute")], &creds).expect("rewritten");
+        let out = inject_mcp_only(line, &[entry("parachute")], &creds).expect("rewritten");
         let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
         let servers = v["params"]["mcpServers"].as_array().unwrap();
         assert_eq!(servers.len(), 2, "{out}");
@@ -267,7 +376,7 @@ mod tests {
         // ACP selects the variant by `type`, and `headers` is required by the
         // schema even when empty. Emitting the stdio shape here means the
         // harness never reaches the server at all.
-        let out = inject(
+        let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("parachute")],
             &creds,
@@ -286,7 +395,7 @@ mod tests {
         // Attached-and-401 is diagnosable; silently absent is not. The agent
         // reports an authorization failure naming the server, which points at
         // the broker rather than at a mystery.
-        let out = inject(
+        let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("parachute")],
             &none,
@@ -301,13 +410,72 @@ mod tests {
     fn the_rewritten_line_stays_newline_terminated() {
         // The child reads line-delimited JSON. Dropping the terminator makes
         // the harness wait for the rest of a message that already arrived.
-        let out = inject(
+        let out = inject_mcp_only(
             r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}"#,
             &[entry("p")],
             &none,
         )
         .expect("rewritten");
         assert!(out.ends_with('\n'), "{out:?}");
+    }
+
+    #[test]
+    fn a_client_cwd_the_container_lacks_becomes_the_workspace() {
+        // The regression this exists for: Buzz sends the directory it is
+        // sitting in on the host, `claude-agent-acp` checks it inside the
+        // container, and rejects the session with `cwd does not exist on the
+        // machine running the agent` — which reads as a hive failure with no
+        // hint that a path was the problem.
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/private/tmp","mcpServers":[]}}"#;
+        let out = inject(line, &[], &none, &workspace, &only_workspace).expect("rewritten");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["params"]["cwd"], "/home/agent/work");
+    }
+
+    #[test]
+    fn a_cwd_the_container_really_has_is_left_alone() {
+        // A spec can bind-mount a host directory into the container at the same
+        // path. Redirecting that to the workspace would silently ignore the
+        // mount the operator configured on purpose.
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/srv/shared"}}"#;
+        assert!(
+            inject(line, &[], &none, &workspace, &everything).is_none(),
+            "a valid cwd and no MCP servers is nothing to rewrite"
+        );
+    }
+
+    #[test]
+    fn the_cwd_is_fixed_even_for_an_agent_with_no_mcp_servers() {
+        // These are independent reasons to rewrite. Gating the cwd fix on
+        // having MCP servers would leave the plainest possible agent — no MCP
+        // at all — as the one that cannot open a session.
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/Users/someone/code"}}"#;
+        let out = inject(line, &[], &creds, &workspace, &only_workspace).expect("rewritten");
+        let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(v["params"]["cwd"], "/home/agent/work");
+        assert!(v["params"].get("mcpServers").is_none(), "invented an mcpServers key");
+    }
+
+    #[test]
+    fn a_stale_cwd_on_any_other_method_is_not_touched() {
+        // Only `session/new` declares a cwd. Rewriting a field that happens to
+        // share the name on some other method would corrupt it.
+        let line = r#"{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"cwd":"/private/tmp"}}"#;
+        assert!(inject(line, &[entry("p")], &creds, &workspace, &only_workspace).is_none());
+    }
+
+    #[test]
+    fn the_workspace_is_not_resolved_when_the_cwd_is_already_good() {
+        // Resolving it costs two `docker` calls per session. This asserts the
+        // laziness rather than trusting the call order to stay that way.
+        let line = r#"{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/srv/shared"}}"#;
+        let calls = std::cell::Cell::new(0);
+        let counting = || {
+            calls.set(calls.get() + 1);
+            "/home/agent/work".to_string()
+        };
+        let _ = inject(line, &[entry("p")], &creds, &counting, &everything);
+        assert_eq!(calls.get(), 0, "resolved the workspace it did not need");
     }
 }
 
