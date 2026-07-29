@@ -59,15 +59,26 @@ pub fn resolve_harness(spec: &AgentSpec) -> Result<&'static HarnessDef, PlanErro
 /// cannot work.
 pub fn requirements(spec: &AgentSpec, agent: &str) -> Result<Vec<Requirement>, PlanError> {
     let h = resolve_harness(spec)?;
-    let mut reqs = vec![Requirement {
-        // Not derived from the agent name: several specs may share one identity
-        // across relays, and the secret key must live in exactly one place.
-        key: CredentialKey::new(spec.identity.credential_key(agent)),
-        // The agent's Nostr identity. Necessarily an env var: buzz-acp reads
-        // BUZZ_PRIVATE_KEY at startup and there is no file or helper form.
-        delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
-        purpose: "the agent's Nostr identity; without it it cannot join the relay at all",
-    }];
+    let mut reqs = Vec::new();
+
+    // The Nostr identity, but ONLY when this container connects to a relay.
+    //
+    // An environment container never starts buzz-acp — the desktop's does, and
+    // it holds the identity. Demanding an nsec here would hold the agent
+    // forever waiting for a key that by design lives somewhere else, and the
+    // hold reads as a missing credential rather than as a mode mismatch.
+    if spec.agent.mode.unwrap_or_default() == hive_spec::AgentMode::Relay {
+        reqs.push(Requirement {
+            // Not derived from the agent name: several specs may share one
+            // identity across relays, and the secret key must live in exactly
+            // one place.
+            key: CredentialKey::new(spec.identity.credential_key(agent)),
+            // Necessarily an env var: buzz-acp reads BUZZ_PRIVATE_KEY at
+            // startup and there is no file or helper form.
+            delivery: Delivery::Env { var: "BUZZ_PRIVATE_KEY".into() },
+            purpose: "the agent's Nostr identity; without it it cannot join the relay at all",
+        });
+    }
 
     // The model-provider credential, but only when it is actually an env var.
     // Codex subscription auth is a file with no env form, and an interactively
@@ -287,10 +298,21 @@ pub fn container_plan(
     Ok(ContainerPlan {
         name: Names::container(agent),
         image: image.to_string(),
-        // The container runs buzz-acp, which spawns the harness named by
-        // BUZZ_ACP_AGENT_COMMAND. The image's ENTRYPOINT wraps this to create
-        // state directories first.
-        command: vec!["buzz-acp".into()],
+        // In relay mode the container runs buzz-acp, which spawns the harness
+        // named by BUZZ_ACP_AGENT_COMMAND. In environment mode buzz-acp lives
+        // outside — wherever the desktop is — so the container must not start
+        // one: it has no nsec and would crash-loop, and `docker exec` into a
+        // crash-looping container fails intermittently rather than cleanly. It
+        // idles instead, and hive-acp execs the harness in.
+        //
+        // Either way the image's ENTRYPOINT runs first and creates the state
+        // directories, which an environment container needs just as much.
+        command: match spec.agent.mode.unwrap_or_default() {
+            hive_spec::AgentMode::Relay => vec!["buzz-acp".into()],
+            hive_spec::AgentMode::Environment => {
+                vec!["sh".into(), "-c".into(), "exec sleep infinity".into()]
+            }
+        },
         env,
         labels: labels_for(agent, &spec.hash(), h.id),
         network: Names::network(agent),
@@ -339,6 +361,46 @@ id = "claude"
             extra = extra
         );
         AgentSpec::from_toml(&base).expect("valid spec")
+    }
+
+    #[test]
+    fn a_relay_agent_runs_buzz_acp_and_an_environment_agent_does_not() {
+        // The two topologies need different containers. In relay mode buzz-acp
+        // lives inside and holds the identity. In environment mode it lives
+        // wherever the desktop is, and hive-acp execs the harness in from
+        // outside — so a container that started its own buzz-acp would have no
+        // nsec, crash-loop, and make `docker exec` fail intermittently rather
+        // than cleanly.
+        let relay = container_plan(
+            &spec_toml(""),
+            "alice",
+            "hive-agent:latest",
+            Default::default(),
+            &Default::default(),
+            None,
+        )
+        .expect("relay plan");
+        assert_eq!(relay.command, vec!["buzz-acp".to_string()]);
+
+        let env_mode = container_plan(
+            &spec_toml("\n[agent]\nmode = \"environment\"\n"),
+            "alice",
+            "hive-agent:latest",
+            Default::default(),
+            &Default::default(),
+            None,
+        )
+        .expect("environment plan");
+        assert!(
+            !env_mode.command.iter().any(|c| c.contains("buzz-acp")),
+            "environment containers must not start buzz-acp: {:?}",
+            env_mode.command
+        );
+        assert!(
+            env_mode.command.iter().any(|c| c.contains("sleep")),
+            "environment containers must stay up so hive-acp can exec in: {:?}",
+            env_mode.command
+        );
     }
 
     #[test]
